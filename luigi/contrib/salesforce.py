@@ -95,6 +95,11 @@ class salesforce(luigi.Config):
     Config system to get config vars from 'salesforce' section in configuration file.
 
     Did not include sandbox_name here, as the user may have multiple sandboxes.
+
+    Authentication uses the OAuth 2.0 client credentials flow when
+    ``client_id`` and ``client_secret`` are set (the recommended replacement
+    for the SOAP ``login()`` operation, which Salesforce retires in Summer
+    '27). Otherwise it falls back to the legacy username/password SOAP login.
     """
 
     username = luigi.Parameter(default="")
@@ -103,6 +108,12 @@ class salesforce(luigi.Config):
 
     # sandbox token
     sb_security_token = luigi.Parameter(default="")
+
+    # OAuth 2.0 client credentials flow (External Client App)
+    client_id = luigi.Parameter(default="")
+    client_secret = luigi.Parameter(default="")
+    # Optional token endpoint override, e.g. https://<mydomain>.my.salesforce.com/services/oauth2/token
+    oauth_token_url = luigi.Parameter(default="")
 
 
 class QuerySalesforce(Task):
@@ -150,7 +161,16 @@ class QuerySalesforce(Task):
         if self.use_sandbox and not self.sandbox_name:
             raise Exception("Parameter sf_sandbox_name must be provided when uploading to a Salesforce Sandbox")
 
-        sf = SalesforceAPI(salesforce().username, salesforce().password, salesforce().security_token, salesforce().sb_security_token, self.sandbox_name)
+        sf = SalesforceAPI(
+            salesforce().username,
+            salesforce().password,
+            salesforce().security_token,
+            salesforce().sb_security_token,
+            self.sandbox_name,
+            client_id=salesforce().client_id,
+            client_secret=salesforce().client_secret,
+            oauth_token_url=salesforce().oauth_token_url,
+        )
 
         job_id = sf.create_operation_job("query", self.object_name, content_type=self.content_type)
         logger.info("Started query job %s in salesforce for object %s" % (job_id, self.object_name))
@@ -234,27 +254,69 @@ class SalesforceAPI:
     SOAP_NS = "{urn:partner.soap.sforce.com}"
     API_NS = "{http://www.force.com/2009/06/asyncapi/dataload}"
 
-    def __init__(self, username, password, security_token, sb_token=None, sandbox_name=None):
+    def __init__(self, username, password, security_token, sb_token=None, sandbox_name=None, client_id=None, client_secret=None, oauth_token_url=None):
         self.username = username
         self.password = password
         self.security_token = security_token
         self.sb_security_token = sb_token
         self.sandbox_name = sandbox_name
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.oauth_token_url = oauth_token_url
 
-        if self.sandbox_name:
+        # The sandbox name is only part of the username for the legacy SOAP login.
+        if self.sandbox_name and not self.uses_oauth:
             self.username += ".%s" % self.sandbox_name
 
         self.session_id = None
         self.server_url = None
         self.hostname = None
 
+    @property
+    def uses_oauth(self):
+        """
+        True if an OAuth 2.0 access token should be used instead of a SOAP login session.
+        """
+        return bool(self.client_id and self.client_secret)
+
     def start_session(self):
         """
         Starts a Salesforce session and determines which SF instance to use for future requests.
+
+        Uses the OAuth 2.0 client credentials flow when a client id and secret are
+        configured, and falls back to the legacy SOAP login otherwise. Salesforce
+        retires SOAP ``login()`` in Summer '27.
         """
         if self.has_active_session():
             raise Exception("Session already in progress.")
 
+        if self.uses_oauth:
+            self._start_oauth_session()
+        else:
+            self._start_soap_session()
+
+        if not self.has_active_session():
+            raise Exception("Invalid login attempt resulted in null sessionId [%s] and/or serverUrl [%s]." % (self.session_id, self.server_url))
+        self.hostname = urlsplit(self.server_url).hostname
+
+    def _start_oauth_session(self):
+        response = requests.post(
+            self._get_oauth_token_url(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            },
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        # The access token is accepted wherever a SOAP session id was used before.
+        self.session_id = payload.get("access_token")
+        self.server_url = payload.get("instance_url")
+
+    def _start_soap_session(self):
         response = requests.post(self._get_login_url(), headers=self._get_login_headers(), data=self._get_login_xml())
         response.raise_for_status()
 
@@ -268,10 +330,6 @@ class SalesforceAPI:
             if self.server_url:
                 raise Exception("Invalid login attempt.  Multiple server urls found.")
             self.server_url = e.text
-
-        if not self.has_active_session():
-            raise Exception("Invalid login attempt resulted in null sessionId [%s] and/or serverUrl [%s]." % (self.session_id, self.server_url))
-        self.hostname = urlsplit(self.server_url).hostname
 
     def has_active_session(self):
         return self.session_id and self.server_url
@@ -548,6 +606,12 @@ class SalesforceAPI:
     def _get_login_url(self):
         server = "login" if not self.sandbox_name else "test"
         return "https://%s.salesforce.com/services/Soap/u/%s" % (server, self.API_VERSION)
+
+    def _get_oauth_token_url(self):
+        if self.oauth_token_url:
+            return self.oauth_token_url
+        server = "test" if self.sandbox_name else "login"
+        return "https://%s.salesforce.com/services/oauth2/token" % server
 
     def _get_base_url(self):
         return "https://%s/services" % self.hostname
