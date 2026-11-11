@@ -1017,8 +1017,14 @@ class TimeDeltaParameter(Parameter[datetime.timedelta]):
         """
         Converts datetime.timedelta to a string
 
+        Values that are negative or have a sub second component cannot be
+        expressed in the "n w n d n h n m n s" form, so they are serialized
+        as a bare number of seconds instead, which :py:meth:`parse` accepts.
+
         :param x: the value to serialize.
         """
+        if x.days < 0 or getattr(x, "microseconds", 0):
+            return str(x.total_seconds())
         weeks = x.days // 7
         days = x.days % 7
         hours = x.seconds // 3600

@@ -1162,6 +1162,35 @@ class TestSerializeTimeDeltaParameters(LuigiTestCase):
         tdelta = timedelta(seconds=0)
         self.assertEqual(luigi.TimeDeltaParameter().serialize(tdelta), "0 w 0 d 0 h 0 m 0 s")
 
+    def testSerializeNegative(self):
+        # Negative values cannot be expressed in the "n w n d n h n m n s" form,
+        # so they are serialized as a bare number of seconds (issue #3473)
+        tdelta = timedelta(hours=-1)
+        self.assertEqual(luigi.TimeDeltaParameter().serialize(tdelta), "-3600.0")
+
+    def testSerializeSubSecond(self):
+        # Sub second values cannot be expressed in the "n w n d n h n m n s"
+        # form, so they are serialized as a bare number of seconds (issue #3473)
+        self.assertEqual(luigi.TimeDeltaParameter().serialize(timedelta(milliseconds=200)), "0.2")
+        self.assertEqual(luigi.TimeDeltaParameter().serialize(timedelta(milliseconds=700)), "0.7")
+        self.assertEqual(luigi.TimeDeltaParameter().serialize(timedelta(microseconds=1)), "1e-06")
+
+    def testSerializeRoundTrip(self):
+        # parse(serialize(x)) must equal x for any timedelta (issue #3473)
+        tdeltas = [
+            timedelta(seconds=0),
+            timedelta(weeks=5, days=4, hours=3, minutes=2, seconds=1),
+            timedelta(hours=-1),
+            timedelta(days=-100, seconds=-1),
+            timedelta(milliseconds=200),
+            timedelta(milliseconds=700),
+            timedelta(microseconds=1),
+            timedelta(days=2, hours=3, minutes=2, seconds=1, microseconds=500),
+        ]
+        p = luigi.TimeDeltaParameter()
+        for tdelta in tdeltas:
+            self.assertEqual(p.parse(p.serialize(tdelta)), tdelta)
+
 
 class TestTaskParameter(LuigiTestCase):
     def testUsage(self):
